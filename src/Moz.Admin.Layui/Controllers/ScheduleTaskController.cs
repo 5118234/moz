@@ -7,9 +7,9 @@ using Moz.Admin.Layui.Models.ScheduleTasks;
 using Moz.Auth.Attributes;
 using Moz.Bus.Dtos.ScheduleTasks;
 using Moz.Bus.Services.ScheduleTasks;
-using Moz.Core.Options;
+using Moz.Common.Types;
+using Moz.Core.Config;
 using Moz.Exceptions;
-using Moz.Utils.Types;
 using Quartz;
 
 namespace Moz.Admin.Layui.Controllers
@@ -18,8 +18,8 @@ namespace Moz.Admin.Layui.Controllers
     public class ScheduleTaskController : AdminAuthBaseController
     {
         private readonly IScheduleTaskService _scheduleTaskService;
-        private readonly MozOptions _mozOptions;
-        public ScheduleTaskController(IScheduleTaskService scheduleTaskService,IOptions<MozOptions> mozOptions)
+        private readonly AppConfig _mozOptions;
+        public ScheduleTaskController(IScheduleTaskService scheduleTaskService,IOptions<AppConfig> mozOptions)
         {
             _scheduleTaskService = scheduleTaskService;
             _mozOptions = mozOptions.Value;

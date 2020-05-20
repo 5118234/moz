@@ -13,15 +13,15 @@ using Moz.Auth.Attributes;
 using Moz.Bus.Dtos;
 using Moz.Bus.Dtos.Auth;
 using Moz.Bus.Dtos.Members;
+using Moz.Bus.Dtos.Request.Members;
 using Moz.Bus.Models.Common;
 using Moz.Bus.Models.Members;
 using Moz.Bus.Services;
 using Moz.Bus.Services.Members;
-using Moz.Core.Options;
+using Moz.Core.Config;
 using Moz.DataBase;
 using Moz.Exceptions;
 using Moz.Service.Security;
-using Moz.WebApi;
 
 namespace Moz.Auth.Impl
 {
@@ -30,22 +30,26 @@ namespace Moz.Auth.Impl
         private readonly IHttpContextAccessor _httpContextAccessor;
         private readonly IMemberService _memberService;
         private readonly IEncryptionService _encryptionService;
-        private readonly IOptions<MozOptions> _mozOptions;
+        private readonly IOptions<AppConfig> _appConfig;
         private readonly IDistributedCache _distributedCache;
         private readonly IJwtService _jwtService;
+        private readonly IRegistrationService _registrationService;
 
         public AuthService(IHttpContextAccessor httpContextAccessor,
             IMemberService memberService,
             IEncryptionService encryptionService,
-            IOptions<MozOptions> mozOptions,
-            IDistributedCache distributedCache, IJwtService jwtService)
+            IOptions<AppConfig> appConfig,
+            IDistributedCache distributedCache, 
+            IJwtService jwtService,
+            IRegistrationService registrationService)
         { 
             _httpContextAccessor = httpContextAccessor;
             _memberService = memberService;
             _encryptionService = encryptionService;
-            _mozOptions = mozOptions;
+            _appConfig = appConfig;
             _distributedCache = distributedCache;
             _jwtService = jwtService;
+            _registrationService = registrationService;
         }
         
         #region Utils
@@ -58,9 +62,10 @@ namespace Moz.Auth.Impl
             var savedPassword = _encryptionService.CreatePasswordHash(enteredPassword, salt,"SHA512");
             return passwordInDb.Equals(savedPassword, StringComparison.OrdinalIgnoreCase);
         }
+        #endregion
 
         /// <summary>
-        /// 
+        /// 获取uid
         /// </summary>
         /// <returns></returns>
         public ServResult<string> GetAuthenticatedUId()
@@ -68,6 +73,7 @@ namespace Moz.Auth.Impl
             var result = _httpContextAccessor 
                 .HttpContext
                 .AuthenticateAsync(MozAuthAttribute.MozAuthorizeSchemes)
+                .ConfigureAwait(false)
                 .GetAwaiter()
                 .GetResult();
             if (!result?.Principal?.Identity?.IsAuthenticated??false) 
@@ -80,8 +86,6 @@ namespace Moz.Auth.Impl
             return claim.Value;
         }
 
-        #endregion
-
         /// <summary>
         /// 
         /// </summary>
@@ -91,7 +95,10 @@ namespace Moz.Auth.Impl
             var result = GetAuthenticatedUId();
             if (result.Code>0)
                 return Error(result.Message,result.Code);
-
+            
+            if(string.IsNullOrEmpty(result.Data))
+                return Error("未登陆",401);
+            
             var member = _memberService.GetSimpleMemberByUId(result.Data);
             
             if (member == null)
@@ -105,26 +112,8 @@ namespace Moz.Auth.Impl
 
             return member;
         }
-
-        public bool AddRoleToMemberId(long memberId, long roleId, DateTime? expDatetime=null) 
-        { 
-            using (var client = DbFactory.GetClient())
-            { 
-                var mRole = client.Queryable<MemberRole>()
-                    .Single(t => t.MemberId == memberId && t.RoleId == roleId);
-                if (mRole != null)
-                    throw new MozException("已添加");
-
-                var id = client.Insertable(new MemberRole
-                {
-                    ExpireDate = expDatetime ?? new DateTime(2099, 1, 1),
-                    MemberId = memberId,
-                    RoleId = roleId
-                }).ExecuteReturnBigIdentity();
-                return id > 0;
-            }
-        }
-
+        
+        
         /// <summary>
         /// 用户名密码登录
         /// </summary>
@@ -184,10 +173,12 @@ namespace Moz.Auth.Impl
                 return Error("密码错误");
             }
 
-            var accessToken = _jwtService.GenerateJwtToken(member.UId);
+            var tokenInfo = _jwtService.GenerateTokenInfo(member.UId);
             return new MemberLoginApo
             {
-                AccessToken = accessToken
+                AccessToken = tokenInfo.JwtToken,
+                RefreshToken = tokenInfo.RefreshToken,
+                ExpireDateTime = tokenInfo.ExpireDateTime
             };
         }
 
@@ -196,41 +187,34 @@ namespace Moz.Auth.Impl
         /// </summary>
         /// <param name="request"></param>
         /// <returns></returns>
-        public ServResult<MemberLoginApo> ExternalAuth(ServRequest<ExternalAuthDto> request)
+        public ServResult<MemberLoginApo> ExternalAuth(ServRequest<ExternalAuthInfo> request)
         {
-            ExternalAuthentication externalAuthentication; 
-            var memberUId = string.Empty;
+            ExternalAuthentication externalAuthentication;
+            string memberUId;
             using (var db = DbFactory.GetClient())
             {
                 externalAuthentication = db.Queryable<ExternalAuthentication>()
-                    .Single(t => t.Openid.Equals(request.Data.OpenId) && t.Provider == request.Data.Provider);
+                    .Single(t =>
+                        t.Openid.Equals(request.Data.OpenId, StringComparison.OrdinalIgnoreCase) &&
+                        t.Provider == request.Data.Provider);
             }
 
             if (externalAuthentication == null)
             {
-                using (var db = DbFactory.GetClient())
+                var registerResult = _registrationService.Register(new ExternalRegistrationRequest
                 {
-                    db.UseTran(tran =>
-                    {
-                        var identify = tran.Insertable(new Identify()).ExecuteReturnBigIdentity();
-                        var registerMemberResult = _memberService.CreateMember(new CreateMemberDto
-                        {
-                            Avatar = request.Data.UserInfo.Avatar,
-                            Username = $"{request.Data.Provider.ToString()}_{identify}"
-                        }); 
-                        tran.Insertable(new ExternalAuthentication()
-                        {
-                            Openid = request.Data.OpenId,
-                            Provider = request.Data.Provider,
-                            AccessToken = request.Data.AccessToken,
-                            ExpireDt = request.Data.ExpireDt,
-                            MemberId = registerMemberResult.Data.Id,
-                            RefreshToken = request.Data.RefreshToken
-                        }).ExecuteCommand();
-                        memberUId = registerMemberResult.Data.UId;
-                        return true;
-                    });
+                    Provider = request.Data.Provider,
+                    AccessToken = request.Data.AccessToken,
+                    ExpireDt = request.Data.ExpireDt,
+                    OpenId = request.Data.OpenId,
+                    RefreshToken = request.Data.RefreshToken,
+                    UserInfo = request.Data.UserInfo
+                });
+                if (registerResult.Code > 0)
+                {
+                    return Error(registerResult.Message, registerResult.Code);
                 }
+                memberUId = registerResult.Data.MemberUId;
             }
             else
             {
@@ -238,8 +222,33 @@ namespace Moz.Auth.Impl
                 using (var db = DbFactory.GetClient())
                 {
                     var member = db.Queryable<Member>()
-                        .Select(it => new { it.Id, it.UId, it.Avatar })
+                        .Select(it => new {it.Id, it.UId, it.Avatar,it.IsDelete, it.IsActive, it.CannotLoginUntilDate})
                         .Single(it => it.Id == memberId);
+                    
+                    if (member == null)
+                    {
+                        return Error("用户不存在");
+                    }
+
+                    if (member.UId.IsNullOrEmpty())
+                    {
+                        return Error("用户UID为空");
+                    }
+
+                    if (member.IsDelete)
+                    {
+                        return Error("用户已删除");
+                    }
+
+                    if (!member.IsActive)
+                    {
+                        return Error("用户未激活");
+                    }
+
+                    if (member.CannotLoginUntilDate != null && member.CannotLoginUntilDate.Value > DateTime.UtcNow)
+                    {
+                        return Error("用户未解封，请等待");
+                    }
 
                     externalAuthentication.AccessToken = request.Data.AccessToken;
                     externalAuthentication.ExpireDt = request.Data.ExpireDt;
@@ -249,7 +258,8 @@ namespace Moz.Auth.Impl
                     {
                         tran.Updateable(externalAuthentication).ExecuteCommand();
 
-                        if (member.Avatar.IsNullOrEmpty() && !(request?.Data?.UserInfo?.Avatar?.IsNullOrEmpty() ?? true))
+                        if (member.Avatar.IsNullOrEmpty() &&
+                            !(request?.Data?.UserInfo?.Avatar?.IsNullOrEmpty() ?? true))
                         {
                             tran.Updateable<Member>()
                                 .SetColumns(it => new Member()
@@ -259,18 +269,18 @@ namespace Moz.Auth.Impl
                                 .Where(it => it.Id == memberId)
                                 .ExecuteCommand();
                         }
-
-                        return 0;
                     });
 
                     memberUId = member.UId;
                 }
             }
-            
-            var accessToken = _jwtService.GenerateJwtToken(memberUId);
+
+            var tokenInfo = _jwtService.GenerateTokenInfo(memberUId);
             return new MemberLoginApo
             {
-                AccessToken = accessToken
+                AccessToken = tokenInfo.JwtToken,
+                RefreshToken = tokenInfo.RefreshToken,
+                ExpireDateTime = tokenInfo.ExpireDateTime
             };
         }
 
@@ -284,7 +294,7 @@ namespace Moz.Auth.Impl
             if(request.Data.Token.IsNullOrEmpty())
                 return Error("Token不能为空");
             
-            var key = _mozOptions.Value.EncryptKey ?? "gvPXwK50tpE9b6P7";
+            var key = _appConfig.Value.AppSecret ?? "gvPXwK50tpE9b6P7";
             var encryptToken = _encryptionService.EncryptText(request.Data.Token, key);
             
             _httpContextAccessor.HttpContext?.Response?.Cookies?.Append("__moz__token",encryptToken,new CookieOptions()

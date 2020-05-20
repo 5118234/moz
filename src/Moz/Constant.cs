@@ -1,8 +1,8 @@
 namespace Moz
 {
-    public class Constant
+    public static class Constant
     {
-        public const string Version = "1.0.3";
-        public const int Code = 103;
+        public const string Version = "1.0.5";
+        public const int Code = 105;
     }
 }

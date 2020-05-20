@@ -15,12 +15,12 @@ using Microsoft.Extensions.Options;
 using Microsoft.Net.Http.Headers;
 using Moz.Aop.Middlewares;
 using Moz.Bus.Dtos;
+using Moz.Common.Types;
 using Moz.Core;
-using Moz.Core.Options;
+using Moz.Core.Config;
 using Moz.DataBase;
 using Moz.Exceptions;
 using Moz.TaskSchedule;
-using Moz.Utils.Types;
 using Newtonsoft.Json;
 
 // ReSharper disable once CheckNamespace
@@ -31,33 +31,33 @@ namespace Microsoft.AspNetCore.Builder
         public static void UseMoz(this IApplicationBuilder application,IWebHostEnvironment env)
         {
             var configuration = application.ApplicationServices.GetService(typeof(IConfiguration)) as IConfiguration;
-            var options = (application.ApplicationServices.GetService(typeof(IOptions<MozOptions>)) as IOptions<MozOptions>)?.Value;
+            var options = (application.ApplicationServices.GetService(typeof(IOptions<AppConfig>)) as IOptions<AppConfig>)?.Value;
             if(options == null)
                 throw new ArgumentNullException(nameof (options));
             
             if (env.IsDevelopment())
-            {
                 application.UseDeveloperExceptionPage();
-            }
 
             application.UseMiddleware<ErrorHandlingMiddleware>();
 
+            
             application.UseStatusCodePages(async context =>
             {
                 var registerType = options.StatusCodePageHandlerType;
-                if (registerType != null &&
-                    application.ApplicationServices.GetService(registerType) is IStatusCodePageHandler handler)
+                if (registerType != null && application.ApplicationServices.GetService(registerType) is IStatusCodePageHandler handler)
                 {
-                    await handler.Process(context.HttpContext);
+                    await handler.Process(context);
                 }
                 else
                 {
                     if (application.ApplicationServices.GetService(typeof(MozStatusCodePageHandler)) is IStatusCodePageHandler mozHandler)
                     {
-                        await mozHandler.Process(context.HttpContext);
+                        await mozHandler.Process(context);
                     }
                 }
             });
+            
+           
             
             application.UseMiddleware<JwtInHeaderMiddleware>();
             
@@ -78,10 +78,10 @@ namespace Microsoft.AspNetCore.Builder
 
             application.UseAuthorization();
 
-            //获取所有的 IMozStartup,执行各个模块的启动类
-            var startupConfigurations = TypeFinder.FindClassesOfType<IMozStartup>();
+            //获取所有的 IAppStartup,执行各个模块的启动类
+            var startupConfigurations = TypeFinder.FindClassesOfType<IAppStartup>();
             var instances = startupConfigurations
-                .Select(startup => (IMozStartup)Activator.CreateInstance(startup.Type))
+                .Select(startup => (IAppStartup)Activator.CreateInstance(startup.Type))
                 .OrderBy(startup => startup.Order);
             foreach (var instance in instances) 
                 instance.Configure(application,configuration, env, options);

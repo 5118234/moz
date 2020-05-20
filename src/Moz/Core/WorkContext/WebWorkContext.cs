@@ -99,7 +99,6 @@ namespace Moz.Core.WorkContext
         }
 
 
-        public bool IsAdmin => throw new NotImplementedException();
 
         #region Language
 

@@ -19,21 +19,23 @@ using Microsoft.IdentityModel.Tokens;
 using Moz.Auth;
 using Moz.Auth.Attributes;
 using Moz.Auth.Handlers;
-using Moz.CMS.Services.Settings;
-using Moz.Configuration;
+using Moz.Common.Types;
 using Moz.Core;
 using Moz.Core.Attributes;
-using Moz.Core.Options;
+using Moz.Core.Config;
 using Moz.Core.WorkContext;
 using Moz.DataBase;
 using Moz.Events;
 using Moz.Events.Publishers;
 using Moz.Exceptions;
+using Moz.Settings;
 using Moz.TaskSchedule;
 using Moz.Utils;
-using Moz.Utils.FileManager;
-using Moz.Utils.Types;
+using Moz.Utils.FileManage;
 using Moz.Validation;
+using Quartz;
+using Quartz.Spi;
+using ISettingService = Moz.Bus.Services.Settings.ISettingService;
 
 // ReSharper disable once CheckNamespace
 namespace Microsoft.Extensions.DependencyInjection
@@ -42,7 +44,7 @@ namespace Microsoft.Extensions.DependencyInjection
     public static class ServiceCollectionExtensions
     {
 
-        public static void AddMoz(this IServiceCollection services, Action<MozOptions> configure)
+        public static void AddMoz(this IServiceCollection services, Action<AppConfig> configure)
         {
             if (services == null)
                 throw new ArgumentNullException(nameof(services));
@@ -57,28 +59,28 @@ namespace Microsoft.Extensions.DependencyInjection
             var configuration = buildServiceProvider.GetService<IConfiguration>();
             var webHostEnvironment = buildServiceProvider.GetService<IWebHostEnvironment>();
 
-            //验证mozOptions
-            var options = buildServiceProvider.GetService<IOptions<MozOptions>>();
-            if (options?.Value == null)
-                throw new Exception(nameof(MozOptions));
+            //验证appConfig
+            var appConfig = buildServiceProvider.GetService<IOptions<AppConfig>>();
+            if (appConfig?.Value == null)
+                throw new ArgumentNullException(nameof(AppConfig));
 
             //必须配置EncryptKey
-            if (options.Value.EncryptKey.IsNullOrEmpty())
-                throw new Exception(nameof(options.Value.EncryptKey));
+            if (appConfig.Value.AppSecret.IsNullOrEmpty())
+                throw new Exception(nameof(appConfig.Value.AppSecret));
 
-            //必须为16位
-            if (options.Value.EncryptKey.Length != 16)
-                throw new Exception("加密KEY位数不正确，必须为16位");
+            //必须为16-32位
+            if (appConfig.Value.AppSecret.Length < 16 || appConfig.Value.AppSecret.Length>32)
+                throw new Exception("加密KEY位数不正确，必须为16-32位");
 
             //检查是否已安装数据库
-            DbFactory.CheckInstalled(options.Value);
+            DbFactory.CheckInstalled(appConfig.Value);
             
-            var serviceProvider = ConfigureServices(services, configuration, webHostEnvironment, options.Value);
+            var serviceProvider = ConfigureServices(services, configuration, webHostEnvironment, appConfig.Value);
             EngineContext.Create(serviceProvider);
         }
 
         private static IServiceProvider ConfigureServices(IServiceCollection services, IConfiguration configuration,
-            IWebHostEnvironment webHostEnvironment, MozOptions mozOptions)
+            IWebHostEnvironment webHostEnvironment, AppConfig mozOptions)
         {
             ServicePointManager.SecurityProtocol =
                 SecurityProtocolType.Tls12 |
@@ -104,7 +106,7 @@ namespace Microsoft.Extensions.DependencyInjection
 
                     cfg.Events = new JwtBearerEvents
                     {
-                        OnAuthenticationFailed = o => throw new AlertException("auth failure")
+                        //OnAuthenticationFailed = o => throw new AlertException("auth failure")
                     };
                 });
 
@@ -117,7 +119,10 @@ namespace Microsoft.Extensions.DependencyInjection
             });
 
             //添加MVC
-            services.AddMvc(options => { })
+            services.AddMvc(options =>
+                {
+                    
+                })
                 .AddRazorRuntimeCompilation()
                 .AddJsonOptions(options => { options.JsonSerializerOptions.PropertyNamingPolicy = null; })
                 .AddFluentValidation(options =>
@@ -141,22 +146,27 @@ namespace Microsoft.Extensions.DependencyInjection
             services.AddSingleton<IHttpContextAccessor, HttpContextAccessor>();
             services.AddSingleton<IActionContextAccessor, ActionContextAccessor>();
             services.AddTransient<IWorkContext, WebWorkContext>();
-            services.AddSingleton<IFileManager, FileManager>();
+            services.AddSingleton<IFileManager, DefaultFileManager>();
             services.AddTransient<HttpContextHelper>();
             services.AddSingleton<IEventPublisher, DefaultEventPublisher>();
             services.AddSingleton<ITaskScheduleManager, TaskScheduleManager>();
             services.AddSingleton<IAuthorizationHandler, DefaultAuthorizationHandler>();
+            services.AddSingleton<IJobFactory, JobFactory>();
 
             //注入服务类 查找所有Service结尾的类进行注册
             var allServiceInterfaces = TypeFinder.GetAllTypes()
                 .Where(t => (t?.IsInterface ?? false) && !t.IsDefined<IgnoreRegisterAttribute>(false) &&
-                            t.Name.EndsWith("Service"));
+                            t.TypeName.EndsWith("Service"));
             foreach (var serviceInterface in allServiceInterfaces)
             {
                 var service = TypeFinder.FindClassesOfType(serviceInterface.Type)?.FirstOrDefault();
                 if (service != null) services.AddTransient(serviceInterface.Type, service.Type);
             }
-
+            
+            //注入所有Job类
+            var jobTypes = TypeFinder.FindClassesOfType<IJob>().ToList();
+            foreach (var jobType in jobTypes)
+                services.AddTransient(jobType.Type);
 
             //注册settings
             var settingTypes = TypeFinder.FindClassesOfType(typeof(ISettings)).ToList();
@@ -172,8 +182,7 @@ namespace Microsoft.Extensions.DependencyInjection
                     var instance = Activator.CreateInstance(settingType.Type);
                     return instance;
                 });
-
-
+            
             //注入 ExceptionHandler
             var exceptionHandlers = TypeFinder.FindClassesOfType(typeof(IExceptionHandler))
                 .Where(it => it.Type != typeof(ErrorHandlingMiddleware))
@@ -202,8 +211,8 @@ namespace Microsoft.Extensions.DependencyInjection
 
             #endregion
 
-            //获取所有的 IMozStartup
-            var startupConfigurations = TypeFinder.FindClassesOfType<IMozStartup>();
+            //获取所有的 IAppStartup
+            var startupConfigurations = TypeFinder.FindClassesOfType<IAppStartup>();
 
             //添加嵌入cshtml资源
             services.Configure<MvcRazorRuntimeCompilationOptions>(options =>
@@ -214,7 +223,7 @@ namespace Microsoft.Extensions.DependencyInjection
 
             //执行各个模块的启动类
             var instances = startupConfigurations
-                .Select(startup => (IMozStartup) Activator.CreateInstance(startup.Type))
+                .Select(startup => (IAppStartup) Activator.CreateInstance(startup.Type))
                 .OrderBy(startup => startup.Order);
             foreach (var instance in instances)
                 instance.ConfigureServices(services, configuration, webHostEnvironment, mozOptions);

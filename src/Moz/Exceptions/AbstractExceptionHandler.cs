@@ -1,18 +1,25 @@
 using System;
+using System.Globalization;
+using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Moz.Bus.Dtos;
+using Moz.Core;
+using Moz.Core.Config;
 using Newtonsoft.Json;
 
 namespace Moz.Exceptions
 {
-    public abstract class AbstractExceptionHandler<T>:IExceptionHandler
+    public abstract class AbstractExceptionHandler<T> : IExceptionHandler
     {
         private readonly ILogger<T> _logger;
         private readonly IWebHostEnvironment _webHostEnvironment;
+        private ExceptionResult _exceptionResult;
 
         protected AbstractExceptionHandler(ILogger<T> logger, IWebHostEnvironment webHostEnvironment)
         {
@@ -22,64 +29,127 @@ namespace Moz.Exceptions
 
         public async Task HandleExceptionAsync(HttpContext context, Exception exception)
         {
-            var isAjaxRequest = context.Request.IsAjaxRequest();
-            var isAcceptJson = context.Request.Headers["Accept"]
-                                   .ToString()?
-                                   .Contains("application/json", StringComparison.OrdinalIgnoreCase) ?? false;
-
-            var res = new ExceptionResult();
+            _exceptionResult = new ExceptionResult();
             switch (exception)
             {
                 case AlertException alertException:
-                    res.Code = alertException.ErrorCode;
-                    res.Message = alertException.Message;
+                    _exceptionResult.Code = alertException.ErrorCode;
+                    _exceptionResult.Message = alertException.Message;
                     break;
                 case FatalException fatalException:
-                    res.Code = fatalException.ErrorCode;
-                    res.Message = fatalException.Message;
-                    _logger.LogError("致命错误",exception);
-                    break;
-                case MozAspectInvocationException aspectInvocationException:
-                    res.Code = aspectInvocationException.ErrorCode;
-                    res.Message = aspectInvocationException.ErrorMessage;
-                    break;
-                case MozException mozException:
-                    res.Code = mozException.ErrorCode;
-                    res.Message = mozException.Message;
+                    _exceptionResult.Code = fatalException.ErrorCode;
+                    _exceptionResult.Message = fatalException.Message;
+                    _logger.LogError("致命错误", exception);
                     break;
                 default:
-                    res.Code = 20000;
-                    res.Message = exception.Message;
-                    _logger.LogError("系统错误",exception);
+                    _exceptionResult.Code = 20000;
+                    _exceptionResult.Message = exception.Message;
+                    _logger.LogError("系统错误", exception);
                     break;
             }
-                
-            if (isAjaxRequest || isAcceptJson)
+
+            await this.OnExceptionAsync(context, exception);
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="context"></param>
+        /// <param name="exception"></param>
+        /// <returns></returns>
+        protected virtual async Task OnExceptionAsync(HttpContext context, Exception exception)
+        {
+            if (IsApiCall(context))
             {
-                await this.OnApiCallAsync(context, res);
+                await OnApiCallAsync(context, exception);
             }
             else
             {
-                if (_webHostEnvironment.IsDevelopment())
-                {
-                    throw exception;
-                }
-                await OnPageCallAsync(context, res);
+                await OnWebCallAsync(context, exception);
             }
         }
 
-        protected virtual async Task OnApiCallAsync(HttpContext context, ExceptionResult result)
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="httpContext"></param>
+        /// <returns></returns>
+        protected virtual bool IsApiCall(HttpContext httpContext)
         {
-            context.Response.ContentType = "application/json;charset=utf-8"; 
-            context.Response.StatusCode = 200;
-            await context.Response.WriteAsync(JsonConvert.SerializeObject(result));
+            var isAjaxRequest = httpContext.Request.IsAjaxRequest();
+            if (isAjaxRequest)
+                return true;
+
+            var isAcceptJson = httpContext.Request.Headers["Accept"]
+                                   .ToString()?
+                                   .Contains("application/json", StringComparison.OrdinalIgnoreCase) ?? false;
+            if (isAcceptJson)
+                return true;
+
+            var isApiController =
+                httpContext.GetEndpoint()?.Metadata?.GetOrderedMetadata<ApiControllerAttribute>()?.Any() ?? false;
+            if (isApiController)
+                return true;
+
+            return false;
         }
-        
-        protected virtual async Task OnPageCallAsync(HttpContext context, ExceptionResult result)
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="context"></param>
+        /// <param name="exception"></param>
+        /// <returns></returns>
+        protected virtual async Task OnApiCallAsync(HttpContext context, Exception exception)
         {
-            context.Response.ContentType = "text/html;charset=utf-8";
+            context.Response.ContentType = "application/json;charset=utf-8";
             context.Response.StatusCode = 200;
-            await context.Response.WriteAsync($"错误:{result.Message}({result.Code})");
+            await context.Response.WriteAsync(JsonConvert.SerializeObject(_exceptionResult));
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="context"></param>
+        /// <param name="exception"></param>
+        /// <returns></returns>
+        /// <exception cref="Exception"></exception>
+        protected virtual async Task OnWebCallAsync(HttpContext context, Exception exception)
+        {
+            if (_webHostEnvironment.IsDevelopment())
+            {
+                throw exception;
+            }
+            
+            context.Response.StatusCode = 200;
+            
+            var options = EngineContext.Current.Resolve<IOptions<AppConfig>>()?.Value;
+            var pathFormat = options?.ErrorPage?.DefaultRedirect;
+            if (string.IsNullOrEmpty(pathFormat))
+            {
+                context.Response.ContentType = "text/html;charset=utf-8";
+                await context.Response.WriteAsync($"<h1>错误({_exceptionResult.Code})</h1><p>{_exceptionResult.Message}</p>");
+            }
+            else
+            {
+                var originalPath = context.Request.Path;
+                var originalQueryString = context.Request.QueryString;
+                
+                //替换 ?? 为 __question_mark__
+                
+                pathFormat = pathFormat.Replace("??", "__question_mark__");
+  
+                var newPath = new PathString(string.Format(CultureInfo.InvariantCulture, 
+                    pathFormat, 
+                    context.Response.StatusCode,
+                    originalPath.Value,
+                    originalQueryString.HasValue ? originalQueryString.Value : null));
+                
+                //替换 __question_mark__ 为 ?
+                
+                var newPath1 = newPath.ToString().Replace("__question_mark__", "?");
+                context.Response.Redirect(newPath1);
+            }
         }
     }
 }

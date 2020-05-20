@@ -2,9 +2,9 @@
 using System.Collections.Generic;
 using System.Linq.Expressions;
 using Moz.Bus.Models.Configuration;
-using Moz.Configuration;
+using Moz.Settings;
 
-namespace Moz.CMS.Services.Settings
+namespace Moz.Bus.Services.Settings
 {
     public interface ISettingService
     {

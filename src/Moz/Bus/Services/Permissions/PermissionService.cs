@@ -46,14 +46,81 @@ namespace Moz.Bus.Services.Permissions
         {
             return _distributedCache.GetOrSet(CACHE_PERMISSION_ALL_KEY, () =>
             {
-                using (var client = DbFactory.GetClient())
+                using (var client = DbFactory.CreateClient())
                 {
                     return client.Queryable<Permission>().OrderBy("id ASC").ToList();
                 }
             });
         }
         
+        /// <summary>
+        /// 更新路径
+        /// </summary>
+        /// <param name="permissionId"></param>
+        private void UpdatePathByPermissionId(long permissionId)
+        {
+            List<Permission> permissions;  
+            using (var db = DbFactory.CreateClient())
+            {
+                permissions = db.Queryable<Permission>().ToList();
+            }
 
+            if (!permissions.Any())
+            {
+                return;
+            }
+            
+            string GetPath(long currentId)
+            {
+                var curPermission = permissions.FirstOrDefault(it => it.Id == currentId);
+                var parentPermissionId = curPermission?.ParentId; 
+                if (parentPermissionId == null || 0 == parentPermissionId)
+                {
+                    return currentId.ToString();
+                }
+                return GetPath(parentPermissionId.Value)+"."+currentId;
+            }
+
+            var updatePermissionsList = new List<Permission>(); 
+            void UpdatePath(long currentId)
+            {
+                var curPermission = permissions.FirstOrDefault(it => it.Id == currentId);
+                if (curPermission == null)
+                {
+                    return;
+                }
+                
+                curPermission.Path = GetPath(currentId);
+                
+                updatePermissionsList.Add(curPermission);
+
+                var subPermissions = permissions.Where(it => it.ParentId == currentId).ToList();
+                if (!subPermissions.Any())
+                {
+                    return;
+                }
+
+                foreach (var subPermission in subPermissions)
+                {
+                    UpdatePath(subPermission.Id);
+                }
+            }
+            
+            UpdatePath(permissionId);
+            if (!updatePermissionsList.Any())
+            {
+                return;
+            }
+
+            using (var db = DbFactory.CreateClient())
+            {
+                db.Updateable(updatePermissionsList)
+                    .UpdateColumns(it => new { it.Path })
+                    .ExecuteCommand();
+            }
+            
+        }
+        
         #endregion
 
         #region Methods
@@ -61,21 +128,21 @@ namespace Moz.Bus.Services.Permissions
         /// <summary>
         /// 获取详细
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="dto"></param>
         /// <returns></returns>
-        public ServResult<PermissionDetailApo> GetPermissionDetail(ServRequest<GetPermissionDetailDto> request)
+        public PublicResult<PermissionDetailInfo> GetPermissionDetail(GetPermissionDetailDto dto)
         {
             Permission permission = null;
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
-                 permission = client.Queryable<Permission>().InSingle(request.Data.Id);
+                 permission = client.Queryable<Permission>().InSingle(dto.Id);
             }
             if(permission == null)
             {
-                return null;
+                return Error("未找到对象");
             }
 
-            var res = new PermissionDetailApo
+            var res = new PermissionDetailInfo
             {
                 Id = permission.Id,
                 Name = permission.Name,
@@ -83,7 +150,8 @@ namespace Moz.Bus.Services.Permissions
                 IsActive = permission.IsActive,
                 ParentId = permission.ParentId,
                 OrderIndex = permission.OrderIndex,
-                IsSystem = permission.IsSystem
+                IsSystem = permission.IsSystem,
+                Path = permission.Path
             };
             return res;
         }
@@ -91,40 +159,44 @@ namespace Moz.Bus.Services.Permissions
         /// <summary>
         /// 插入
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="dto"></param>
         /// <returns></returns>
-        public ServResult CreatePermission(ServRequest<CreatePermissionDto> request)
+        public PublicResult CreatePermission(CreatePermissionDto dto)
         {
             var permission = new Permission
             {
-                Name = request.Data.Name, 
-                Code = request.Data.Code,
-                IsActive = request.Data.IsActive,
-                ParentId = request.Data.ParentId,
+                Name = dto.Name, 
+                Code = dto.Code,
+                IsActive = dto.IsActive,
+                ParentId = dto.ParentId,
                 OrderIndex = 0,
                 IsSystem = false
             };
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
                 permission.Id = client.Insertable(permission).ExecuteReturnBigIdentity();
             }
+
+            this.UpdatePathByPermissionId(permission.Id);
+            
             _distributedCache.Remove(CACHE_ROLE_PERMISSION_ALL_KEY);
             _distributedCache.Remove(CACHE_PERMISSION_ALL_KEY);
             _eventPublisher.EntityCreated(permission);
+            
             return Ok();
         }
         
         /// <summary>
         /// 更新
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="dto"></param>
         /// <returns></returns>
-        public ServResult UpdatePermission(ServRequest<UpdatePermissionDto> request)
+        public PublicResult UpdatePermission(UpdatePermissionDto dto)
         {
             Permission permission = null;
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
-                permission = client.Queryable<Permission>().InSingle(request.Data.Id);
+                permission = client.Queryable<Permission>().InSingle(dto.Id);
                 if (permission == null)
                 {
                     return Error("找不到该条信息");
@@ -135,29 +207,33 @@ namespace Moz.Bus.Services.Permissions
                     return Error("内置信息不能修改");
                 }
 
-                permission.Name = request.Data.Name;
-                permission.Code = request.Data.Code;
-                permission.IsActive = request.Data.IsActive;
-                permission.ParentId = request.Data.ParentId;
+                permission.Name = dto.Name;
+                permission.Code = dto.Code;
+                permission.IsActive = dto.IsActive;
+                permission.ParentId = dto.ParentId;
                 client.Updateable(permission).ExecuteCommand();
             }
+            
+            this.UpdatePathByPermissionId(permission.Id);
+            
             _distributedCache.Remove(CACHE_ROLE_PERMISSION_ALL_KEY);
             _distributedCache.Remove(CACHE_PERMISSION_ALL_KEY);
             _eventPublisher.EntityUpdated(permission);
+            
             return Ok();
         }
 
         /// <summary>
         /// 删除
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="dto"></param>
         /// <returns></returns>
-        public ServResult DeletePermission(ServRequest<DeletePermissionDto> request)
+        public PublicResult DeletePermission(DeletePermissionDto dto)
         {
             Permission permission = null;
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
-                permission = client.Queryable<Permission>().InSingle(request.Data.Id);
+                permission = client.Queryable<Permission>().InSingle(dto.Id);
                 if (permission == null)
                 {
                     return Error("找不到该条信息");
@@ -166,25 +242,32 @@ namespace Moz.Bus.Services.Permissions
                 {
                     return Error("内置信息不能删除");
                 }
-                client.Deleteable<Permission>(request.Data.Id).ExecuteCommand();
+                
+                client.UseTran(tran =>
+                {
+                    tran.Ado.ExecuteCommand(@"DELETE FROM tab_permission WHERE path LIKE @path", new { path = $"{permission.Path}.%"});
+                    tran.Deleteable<Permission>(dto.Id).ExecuteCommand();
+                });
             }
+            
             _distributedCache.Remove(CACHE_ROLE_PERMISSION_ALL_KEY);
             _distributedCache.Remove(CACHE_PERMISSION_ALL_KEY);
             _eventPublisher.EntityDeleted(permission);
+            
             return Ok();
         }
         
         /// <summary>
         /// 
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="dto"></param>
         /// <returns></returns>
-        public ServResult SetOrderIndex(ServRequest<SetOrderIndexPermissionDto> request)
+        public PublicResult SetOrderIndex(SetOrderIndexPermissionDto dto)
         {
             Permission permission = null;
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
-                permission = client.Queryable<Permission>().InSingle(request.Data.Id);
+                permission = client.Queryable<Permission>().InSingle(dto.Id);
                 if (permission == null)
                 {
                     return Error("找不到该条信息");
@@ -195,24 +278,23 @@ namespace Moz.Bus.Services.Permissions
                 }
                 client.Updateable<Permission>().SetColumns(it=>new Permission
                 {
-                    OrderIndex = request.Data.OrderIndex
-                }).Where(it=>it.Id==request.Data.Id).ExecuteCommand();
+                    OrderIndex = dto.OrderIndex
+                }).Where(it=>it.Id==dto.Id).ExecuteCommand();
             }
-            _eventPublisher.EntityDeleted(permission);
             return Ok();
         }
         
         /// <summary>
         /// 
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="dto"></param>
         /// <returns></returns>
-        public ServResult SetIsActive(ServRequest<SetIsActivePermissionDto> request)
+        public PublicResult SetIsActive(SetIsActivePermissionDto dto)
         {
             Permission permission = null;
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
-                permission = client.Queryable<Permission>().InSingle(request.Data.Id);
+                permission = client.Queryable<Permission>().InSingle(dto.Id);
                 if (permission == null)
                 {
                     return Error("找不到该条信息");
@@ -224,11 +306,12 @@ namespace Moz.Bus.Services.Permissions
                 client.Updateable<Permission>().SetColumns(it=>new Permission
                 {
                     IsActive = !it.IsActive
-                }).Where(it=>it.Id==request.Data.Id).ExecuteCommand();
+                }).Where(it=>it.Id==dto.Id).ExecuteCommand();
             }
+            
             _distributedCache.Remove(CACHE_ROLE_PERMISSION_ALL_KEY);
             _distributedCache.Remove(CACHE_PERMISSION_ALL_KEY);
-            _eventPublisher.EntityDeleted(permission);
+            
             return Ok();
         }
 
@@ -237,13 +320,13 @@ namespace Moz.Bus.Services.Permissions
         /// <summary>
         /// 分页查询
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="dto"></param>
         /// <returns></returns>
-        public ServResult<PagedList<QueryPermissionItem>> PagedQueryPermissions(ServRequest<PagedQueryPermissionDto> request)
+        public PublicResult<PagedList<QueryPermissionItem>> PagedQueryPermissions(PagedQueryPermissionDto dto)
         {
-            var page = request.Data.Page ?? 1;
-            var pageSize = request.Data.PageSize ?? 20;
-            using (var client = DbFactory.GetClient())
+            var page = dto.Page ?? 1;
+            var pageSize = dto.PageSize ?? 20;
+            using (var client = DbFactory.CreateClient())
             {
                 var total = 0;
                 var list = client.Queryable<Permission>()
@@ -260,6 +343,12 @@ namespace Moz.Bus.Services.Permissions
                     })
                     .OrderBy("order_index ASC,id ASC")
                     .ToPageList(page, pageSize,ref total);
+                /*
+                foreach (var item in list)
+                {
+                    UpdatePathByPermissionId(item.Id);
+                }
+                */
                 return new PagedList<QueryPermissionItem>
                 {
                     List = list,
@@ -275,11 +364,11 @@ namespace Moz.Bus.Services.Permissions
         /// 
         /// </summary>
         /// <returns></returns>
-        public ServResult<List<AvailablePermission>> GetAvailablePermissions()
+        public PublicResult<List<AvailablePermission>> GetAvailablePermissions()
         {
             return _distributedCache.GetOrSet(CACHE_ROLE_PERMISSION_ALL_KEY, () =>
             {
-                using (var client = DbFactory.GetClient())
+                using (var client = DbFactory.CreateClient())
                 {
                     return client.Queryable<RolePermission, Role, Permission>(
                             (rp, r, p) => new object[]
@@ -305,11 +394,11 @@ namespace Moz.Bus.Services.Permissions
         /// <summary>
         /// 查询所有子类
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="parentId"></param>
         /// <returns></returns>
-        public ServResult<List<PermissionTree>> QuerySubPermissionsByParentId(ServRequest<long?> request)
+        public PublicResult<List<PermissionTree>> QuerySubPermissionsByParentId(long? parentId)
         {
-            return GetAllSubPermissions(request.Data);
+            return GetAllSubPermissions(parentId);
         }
 
         /// <summary>

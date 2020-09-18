@@ -28,10 +28,10 @@ using Moz.DataBase;
 using Moz.Events;
 using Moz.Events.Publishers;
 using Moz.Exceptions;
+using Moz.FileStorage;
 using Moz.Settings;
 using Moz.TaskSchedule;
 using Moz.Utils;
-using Moz.Utils.FileManage;
 using Moz.Validation;
 using Quartz;
 using Quartz.Spi;
@@ -119,10 +119,8 @@ namespace Microsoft.Extensions.DependencyInjection
             });
 
             //添加MVC
-            services.AddMvc(options =>
-                {
-                    
-                })
+            services.AddMvc(options => { })
+                .ConfigureApiBehaviorOptions(options => { options.SuppressModelStateInvalidFilter = true; })
                 .AddRazorRuntimeCompilation()
                 .AddJsonOptions(options => { options.JsonSerializerOptions.PropertyNamingPolicy = null; })
                 .AddFluentValidation(options =>
@@ -133,25 +131,28 @@ namespace Microsoft.Extensions.DependencyInjection
                 });
 
 
-
+            /*
             services.AddApiVersioning(o =>
             {
                 o.ReportApiVersions = true;
                 o.AssumeDefaultVersionWhenUnspecified = true;
                 o.DefaultApiVersion = new ApiVersion(1, 0);
             });
+            */
 
             #region 依赖注入
 
             services.AddSingleton<IHttpContextAccessor, HttpContextAccessor>();
             services.AddSingleton<IActionContextAccessor, ActionContextAccessor>();
             services.AddTransient<IWorkContext, WebWorkContext>();
-            services.AddSingleton<IFileManager, DefaultFileManager>();
+            services.AddSingleton<IFileUploader, LocalFileUploader>();
             services.AddTransient<HttpContextHelper>();
             services.AddSingleton<IEventPublisher, DefaultEventPublisher>();
             services.AddSingleton<ITaskScheduleManager, TaskScheduleManager>();
             services.AddSingleton<IAuthorizationHandler, DefaultAuthorizationHandler>();
             services.AddSingleton<IJobFactory, JobFactory>();
+            services.AddTransient<FileStorageDataSource>();
+            services.AddTransient<IFileManager, DefaultFileManager>();
 
             //注入服务类 查找所有Service结尾的类进行注册
             var allServiceInterfaces = TypeFinder.GetAllTypes()
@@ -162,11 +163,16 @@ namespace Microsoft.Extensions.DependencyInjection
                 var service = TypeFinder.FindClassesOfType(serviceInterface.Type)?.FirstOrDefault();
                 if (service != null) services.AddTransient(serviceInterface.Type, service.Type);
             }
-            
+
             //注入所有Job类
             var jobTypes = TypeFinder.FindClassesOfType<IJob>().ToList();
             foreach (var jobType in jobTypes)
                 services.AddTransient(jobType.Type);
+
+            //注入所有Uploader类
+            var uploaderTypes = TypeFinder.FindClassesOfType<IFileUploader>();
+            foreach (var uploaderType in uploaderTypes)
+                services.AddTransient(uploaderType.Type);
 
             //注册settings
             var settingTypes = TypeFinder.FindClassesOfType(typeof(ISettings)).ToList();
@@ -182,7 +188,7 @@ namespace Microsoft.Extensions.DependencyInjection
                     var instance = Activator.CreateInstance(settingType.Type);
                     return instance;
                 });
-            
+
             //注入 ExceptionHandler
             var exceptionHandlers = TypeFinder.FindClassesOfType(typeof(IExceptionHandler))
                 .Where(it => it.Type != typeof(ErrorHandlingMiddleware))

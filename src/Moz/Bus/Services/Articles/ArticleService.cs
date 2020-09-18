@@ -5,9 +5,10 @@ using System.Reflection;
 using Microsoft.Extensions.Caching.Distributed;
 using Moz.Biz.Dtos.Articles;
 using Moz.Biz.Dtos.Articles.ArticleModels;
-using Moz.Biz.Services.Articles;
+using Moz.Bus.Dtos;
 using Moz.Bus.Dtos.Articles;
 using Moz.Bus.Dtos.Articles.ArticleModels;
+using Moz.Bus.Dtos.Categories;
 using Moz.Bus.Models.Articles;
 using Moz.Bus.Services.Categories;
 using Moz.Common;
@@ -22,15 +23,14 @@ using SqlSugar;
 namespace Moz.Bus.Services.Articles
 {
     // ReSharper disable once ClassNeverInstantiated.Global
-    public class ArticleService : IArticleService
+    public class ArticleService : BaseService,IArticleService
     {
         private readonly IDistributedCache _distributedCache;
         private readonly IEventPublisher _eventPublisher;
         private readonly ICategoryService _categoryService;
 
-#pragma warning disable 169
         private readonly string CACHE_KEY_ARTICLE_TYPE_ID = "CACHE_KEY_ARTICLE_TYPE_ID_{0}";
-#pragma warning restore 169
+
 
         public ArticleService(
             IDistributedCache distributedCache,
@@ -51,7 +51,7 @@ namespace Moz.Bus.Services.Articles
         /// <returns></returns>
         public GetArticleDetailResponse GetArticleDetail(GetArticleDetailRequest request)
         {
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
                  var article = client.Queryable<Article>().InSingle(request.Id);
                  if(article == null)
@@ -116,7 +116,7 @@ namespace Moz.Bus.Services.Articles
         /// <returns></returns>
         public CreateArticleResponse CreateArticle(CreateArticleRequest request)
         {
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
                 var article = new Article
                 {
@@ -168,7 +168,6 @@ namespace Moz.Bus.Services.Articles
                 };
                 article.Id = client.Insertable(article).ExecuteReturnBigIdentity();
                 
-                //_cacheManager.RemoveOnEntityCreated<Article>();
                 _eventPublisher.EntityCreated(article);
                 
                 return new CreateArticleResponse();
@@ -184,7 +183,7 @@ namespace Moz.Bus.Services.Articles
         /// <returns></returns>
         public UpdateArticleResponse UpdateArticle(UpdateArticleRequest request)
         {
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
                 var article = client.Queryable<Article>().InSingle(request.Id);
                 if (article == null)
@@ -237,7 +236,6 @@ namespace Moz.Bus.Services.Articles
                 article.Text4 = request.Text4;
                 client.Updateable( article).ExecuteCommand();    
                 
-                //_cacheManager.RemoveOnEntityUpdated<Article>(request.Id);
                 _eventPublisher.EntityUpdated(article);
                 
                 return new UpdateArticleResponse();
@@ -251,7 +249,7 @@ namespace Moz.Bus.Services.Articles
         /// <returns></returns>
         public DeleteArticleResponse DeleteArticle(DeleteArticleRequest request)
         {
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
                 var article = client.Queryable<Article>().InSingle(request.Id);
                 if (article == null)
@@ -261,7 +259,6 @@ namespace Moz.Bus.Services.Articles
 
                 client.Deleteable<Article>(request.Id).ExecuteCommand();
                 
-                //_cacheManager.RemoveOnEntityDeleted<Article>(request.Id);
                 _eventPublisher.EntityDeleted(article);
                 
                 return new DeleteArticleResponse();
@@ -275,7 +272,7 @@ namespace Moz.Bus.Services.Articles
         /// <returns></returns>
         public BulkDeleteArticlesResponse BulkDeleteArticles(BulkDeleteArticlesRequest request)
         {
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
                 client.Deleteable<Article>().In(request.Ids).ExecuteCommand();
                 
@@ -292,21 +289,21 @@ namespace Moz.Bus.Services.Articles
         /// <summary>
         /// 
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="dto"></param>
         /// <returns></returns>
-        public PagedQueryArticleResponse PagedQueryArticles(PagedQueryArticleRequest request)
+        public PublicResult<PagedQueryArticles> PagedQueryArticles(PagedQueryArticleDto dto)
         {
-            var page = request.Page ?? 1;
-            var pageSize = request.PageSize ?? 20;
-
+            var page = dto.Page ?? 1;
+            var pageSize = dto.PageSize ?? 20;
+ 
             ArticleModel model = null;
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
-                model = client.Queryable<ArticleModel>().InSingle(request.ArticleModelId);
+                model = client.Queryable<ArticleModel>().InSingle(dto.ArticleModelId);
             }
 
             if (model == null)
-                throw new AlertException("找不到文章模型");
+                return Error("找不到文章模型");
 
             //设置字段
             var articleProperties = GenericCache<ArticleTypeInfo>
@@ -318,25 +315,28 @@ namespace Moz.Bus.Services.Articles
                 {
                     var sugarColumn = articleProperties
                         .FirstOrDefault(x => x.Name.Equals(it.FiledName, StringComparison.OrdinalIgnoreCase))
-                        .GetCustomAttribute<SugarColumn>();
+                        ?.GetCustomAttribute<SugarColumn>();
                     return sugarColumn == null ? it.FiledName : sugarColumn.ColumnName;
                 }).ToArray().Join(",");
             selectFields += selectFields.IsNullOrEmpty() ? "id,category_id" : ",id,category_id";
-
             
-            //类别
-            var categories = new long[] { };
-            //if (request.CategoryId > 0)
-            //    categories = _categoryService.GetChildrenIdsByParentId(request.CategoryId).ToArray();
-
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
                 var total = 0;
-                
-                var query = client.Queryable<Article>()
-                    .Where(it => it.ArticleTypeId == request.ArticleModelId)
-                    .WhereIF(request.CategoryId > 0, it=> categories.Contains(it.CategoryId.Value));
 
+                var query = client.Queryable<Article>()
+                    .Where(it => it.ArticleTypeId == dto.ArticleModelId);
+
+                if (dto.CategoryId > 0)
+                {
+                    var queryChildrenIdsByParentIdResult = _categoryService.QueryChildrenIdsByParentId(dto.CategoryId, true);
+                    if (queryChildrenIdsByParentIdResult.Code==0 
+                        && queryChildrenIdsByParentIdResult.Data!=null
+                        && queryChildrenIdsByParentIdResult.Data.Any())
+                    {
+                        query = query.Where(it => queryChildrenIdsByParentIdResult.Data.Contains(it.CategoryId.Value));
+                    }
+                }
 
                 query = query.Select(selectFields);
 
@@ -344,7 +344,7 @@ namespace Moz.Bus.Services.Articles
                     .OrderBy("id DESC")
                     .ToPageList(page, pageSize, ref total);
                 
-                return new PagedQueryArticleResponse()
+                return new PagedQueryArticles()
                 {
                     List = list.Select(it => new QueryArticleItem
                     {
@@ -412,7 +412,7 @@ namespace Moz.Bus.Services.Articles
         /// <returns></returns>
         public GetArticleModelDetailResponse GetArticleModelDetail(GetArticleModelDetailRequest request)
         {
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
                  var articleModel = client.Queryable<ArticleModel>().InSingle(request.Id);
                  if(articleModel == null)
@@ -436,7 +436,7 @@ namespace Moz.Bus.Services.Articles
         /// <returns></returns>
         public CreateArticleModelResponse CreateArticleModel(CreateArticleModelRequest request)
         {
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
                 var articleModel = new ArticleModel
                 {
@@ -463,7 +463,7 @@ namespace Moz.Bus.Services.Articles
         /// <returns></returns>
         public UpdateArticleModelResponse UpdateArticleModel(UpdateArticleModelRequest request)
         {
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
                 var articleModel = client.Queryable<ArticleModel>().InSingle(request.Id);
                 if (articleModel == null)
@@ -491,7 +491,7 @@ namespace Moz.Bus.Services.Articles
         /// <returns></returns>
         public DeleteArticleModelResponse DeleteArticleModel(DeleteArticleModelRequest request)
         {
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
                 var articleModel = client.Queryable<ArticleModel>().InSingle(request.Id);
                 if (articleModel == null)
@@ -517,7 +517,7 @@ namespace Moz.Bus.Services.Articles
         {
             var page = request.Page ?? 1;
             var pageSize = request.PageSize ?? 20;
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
                 var total = 0;
                 var list = client.Queryable<ArticleModel>()

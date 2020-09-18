@@ -1,33 +1,36 @@
 using System;
+using System.Linq;
 using Moz.Bus.Dtos;
-using Moz.Bus.Dtos.Request.Members;
-using Moz.Bus.Dtos.Result.Members;
+using Moz.Bus.Dtos.Members;
 using Moz.Bus.Models.Common;
 using Moz.Bus.Models.Members;
 using Moz.DataBase;
 using Moz.Events;
+using Moz.Service.Security;
 
 namespace Moz.Bus.Services.Members
 {
     public class RegistrationService :BaseService, IRegistrationService
     {
         private readonly IEventPublisher _eventPublisher;
+        private readonly IEncryptionService _encryptionService;
 
-        public RegistrationService(IEventPublisher eventPublisher)
+        public RegistrationService(IEventPublisher eventPublisher, IEncryptionService encryptionService)
         {
             _eventPublisher = eventPublisher;
+            _encryptionService = encryptionService;
         }
 
         /// <summary>
-        /// 注册
+        /// 三方平台注册
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="dto"></param>
         /// <returns></returns>
-        public ServResult<RegistrationResult> Register(ServRequest<ExternalRegistrationRequest> request)
+        public PublicResult<RegistrationInfo> Register(ExternalRegistrationDto dto)
         {
             var memberUId = string.Empty;
             var memberId = 0L;
-            using (var db = DbFactory.GetClient())
+            using (var db = DbFactory.CreateClient())
             {
                 db.UseTran(tran =>
                 {
@@ -37,8 +40,8 @@ namespace Moz.Bus.Services.Members
                     {
                         UId = memberUId,
                         Address = null,
-                        Avatar = request.Data.UserInfo?.Avatar,
-                        Nickname = request.Data.UserInfo?.Nickname,
+                        Avatar = dto.UserInfo?.Avatar,
+                        Nickname = dto.UserInfo?.Nickname,
                         Birthday = null,
                         CannotLoginUntilDate = null,
                         Email = null,
@@ -62,7 +65,7 @@ namespace Moz.Bus.Services.Members
                         RegionCode = null,
                         RegisterDatetime = DateTime.Now,
                         RegisterIp = null,
-                        Username = $"{request.Data.Provider.ToString()}_{identify}"
+                        Username = $"{dto.Provider.ToString()}_{identify}"
                     };
                     memberId = tran.Insertable(member).ExecuteReturnBigIdentity();
                     tran.Insertable(new MemberRole
@@ -73,17 +76,17 @@ namespace Moz.Bus.Services.Members
                     }).ExecuteCommand();
                     tran.Insertable(new ExternalAuthentication()
                     {
-                        Openid = request.Data.OpenId,
-                        Provider = request.Data.Provider,
-                        AccessToken = request.Data.AccessToken,
-                        ExpireDt = request.Data.ExpireDt,
+                        Openid = dto.OpenId,
+                        Provider = dto.Provider,
+                        AccessToken = dto.AccessToken,
+                        ExpireDt = dto.ExpireDt,
                         MemberId = memberId,
-                        RefreshToken = request.Data.RefreshToken
+                        RefreshToken = dto.RefreshToken
                     }).ExecuteCommand();
                 });
             }
             
-            var result = new RegistrationResult
+            var result = new RegistrationInfo
             {
                 MemberId = memberId,
                 MemberUId = memberUId
@@ -91,6 +94,84 @@ namespace Moz.Bus.Services.Members
             
             _eventPublisher.Publish(result);
             
+            return result;
+        }
+
+        /// <summary>
+        /// 用户名密码注册
+        /// </summary>
+        /// <param name="dto"></param>
+        /// <returns></returns>
+        public PublicResult<RegistrationInfo> Register(UsernameRegistrationDto dto)
+        {
+            var memberUId = string.Empty;
+            var memberId = 0L;
+            using (var db = DbFactory.CreateClient())
+            {
+                var isExist = db.Queryable<Member>()
+                    .Where(it => it.Username.Equals(dto.Username))
+                    .Select(it => new {it.Id})
+                    .ToList()
+                    .Any();
+                if (isExist)
+                {
+                    return Error($"用户名 {dto.Username} 已存在");
+                }
+
+                db.UseTran(tran =>
+                {
+                    memberUId = Guid.NewGuid().ToString("N");
+                    var saltKey = _encryptionService.CreateSaltKey(6);
+                    var hashedPassword = _encryptionService.CreatePasswordHash(dto.Password, saltKey, "SHA512");
+                    var member = new Member
+                    {
+                        UId = memberUId,
+                        Address = null,
+                        Avatar = null,
+                        Nickname = null,
+                        Birthday = null,
+                        CannotLoginUntilDate = null,
+                        Email = null,
+                        FailedLoginAttempts = 0,
+                        Gender = GenderEnum.Man,
+                        Geohash = null,
+                        IsActive = true,
+                        IsDelete = false,
+                        IsEmailValid = false,
+                        IsMobileValid = false,
+                        LastActiveDatetime = DateTime.Now,
+                        LastLoginDatetime = DateTime.Now,
+                        LastLoginIp = null,
+                        Lat = null,
+                        Lng = null,
+                        LoginCount = 0,
+                        Mobile = null,
+                        OnlineTimeCount = 0,
+                        Password = hashedPassword,
+                        PasswordSalt = saltKey,
+                        RegionCode = null,
+                        RegisterDatetime = DateTime.Now,
+                        RegisterIp = null,
+                        Username = dto.Username
+                    };
+                    memberId = tran.Insertable(member).ExecuteReturnBigIdentity();
+                    tran.Insertable(new MemberRole
+                    {
+                        ExpireDate = null,
+                        MemberId = memberId,
+                        RoleId = 3
+                    }).ExecuteCommand();
+                });
+            }
+
+            var result = new RegistrationInfo
+            {
+                MemberId = memberId,
+                MemberUId = memberUId
+            };
+
+            _eventPublisher.Publish(result);
+
             return result;
         }
     }

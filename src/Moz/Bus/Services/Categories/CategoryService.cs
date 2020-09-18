@@ -15,10 +15,8 @@ namespace Moz.Bus.Services.Categories
     {
         #region Constants
 
-        // ReSharper disable once InconsistentNaming
-        // ReSharper disable once MemberCanBePrivate.Global
-        public static readonly string CACHE_CATEGORY_ALL_KEY = "CACHE_CATEGORY_ALL_KEY";
-        
+        public const string CACHE_CATEGORY_ALL_KEY = "CACHE_CATEGORY_ALL_KEY";
+
         #endregion
 
         #region Fields
@@ -46,7 +44,7 @@ namespace Moz.Bus.Services.Categories
         {
             return _distributedCache.GetOrSet(CACHE_CATEGORY_ALL_KEY, () =>
             {
-                using (var client = DbFactory.GetClient())
+                using (var client = DbFactory.CreateClient())
                 {
                     return client.Queryable<Category>().OrderBy("order_index ASC , id ASC").ToList();
                 }
@@ -58,10 +56,10 @@ namespace Moz.Bus.Services.Categories
         /// 更新路径
         /// </summary>
         /// <param name="categoryId"></param>
-        private static void UpdatePathByCategoryId(long categoryId)
+        private void UpdatePathByCategoryId(long categoryId)
         {
             List<Category> categories; 
-            using (var db = DbFactory.GetClient())
+            using (var db = DbFactory.CreateClient())
             {
                 categories = db.Queryable<Category>().ToList();
             }
@@ -113,7 +111,7 @@ namespace Moz.Bus.Services.Categories
                 return;
             }
 
-            using (var db = DbFactory.GetClient())
+            using (var db = DbFactory.CreateClient())
             {
                 db.Updateable(updateCategoriesList)
                     .UpdateColumns(it => new { it.Path })
@@ -129,45 +127,48 @@ namespace Moz.Bus.Services.Categories
         /// <summary>
         /// 获取详细
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="dto"></param>
         /// <returns></returns>
-        public ServResult<CategoryDetail> GetCategoryDetail(ServRequest<GetCategoryDetailDto> request)
+        public PublicResult<CategoryDetail> GetCategoryDetail(GetCategoryDetailDto dto)
         {
             Category category = null;
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
-                 category = client.Queryable<Category>().InSingle(request.Data.Id);
+                 category = client.Queryable<Category>().InSingle(dto.Id);
             }
             if(category == null)
             {
                 return null;
             }
-            var res = new CategoryDetail();
-            res.Id = category.Id;
-            res.Name = category.Name;
-            res.Alias = category.Alias;
-            res.Description = category.Description;
-            res.OrderIndex = category.OrderIndex;
-            res.ParentId = category.ParentId;
-            res.Path = category.Path;
+
+            var res = new CategoryDetail
+            {
+                Id = category.Id,
+                Name = category.Name,
+                Alias = category.Alias,
+                Description = category.Description,
+                OrderIndex = category.OrderIndex,
+                ParentId = category.ParentId,
+                Path = category.Path
+            };
             return res;
         }
 
         /// <summary>
         /// 插入
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="dto"></param>
         /// <returns></returns>
-        public ServResult CreateCategory(ServRequest<CreateCategoryDto> request)
+        public PublicResult CreateCategory(CreateCategoryDto dto)
         {
             var category = new Category
             {
-                Name = request.Data.Name,
-                Alias = request.Data.Alias,
-                Description = request.Data.Description,
-                ParentId = request.Data.ParentId
+                Name = dto.Name,
+                Alias = dto.Alias,
+                Description = dto.Description,
+                ParentId = dto.ParentId
             };
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
                 category.Id = client.Insertable(category).ExecuteReturnBigIdentity();
             }
@@ -180,22 +181,22 @@ namespace Moz.Bus.Services.Categories
         /// <summary>
         /// 更新
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="dto"></param>
         /// <returns></returns>
-        public ServResult UpdateCategory(ServRequest<UpdateCategoryDto> request)
+        public PublicResult UpdateCategory(UpdateCategoryDto dto)
         {
             Category category = null;
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
-                category = client.Queryable<Category>().InSingle(request.Data.Id);
+                category = client.Queryable<Category>().InSingle(dto.Id);
                 if (category == null)
                 {
                     return Error("找不到该条信息");
                 }
-                category.Name = request.Data.Name; 
-                category.Alias = request.Data.Alias;
-                category.Description = request.Data.Description;
-                category.ParentId = request.Data.ParentId;
+                category.Name = dto.Name; 
+                category.Alias = dto.Alias;
+                category.Description = dto.Description;
+                category.ParentId = dto.ParentId;
                 client.Updateable(category).ExecuteCommand();
             }
             UpdatePathByCategoryId(category.Id);
@@ -207,19 +208,24 @@ namespace Moz.Bus.Services.Categories
         /// <summary>
         /// 删除
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="dto"></param>
         /// <returns></returns>
-        public ServResult DeleteCategory(ServRequest<DeleteCategoryDto> request)
+        public PublicResult DeleteCategory(DeleteCategoryDto dto)
         {
             Category category = null;
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
-                category = client.Queryable<Category>().InSingle(request.Data.Id);
+                category = client.Queryable<Category>().InSingle(dto.Id);
                 if (category == null)
                 {
                     return Error("找不到该条信息");
                 }
-                client.Deleteable<Category>(request.Data.Id).ExecuteCommand();
+
+                client.UseTran(tran =>
+                {
+                    tran.Ado.ExecuteCommand(@"DELETE FROM tab_category WHERE path LIKE @path", new { path = $"{category.Path}.%"});
+                    tran.Deleteable<Category>(dto.Id).ExecuteCommand();
+                });
             }
             _distributedCache.Remove(CACHE_CATEGORY_ALL_KEY);
             _eventPublisher.EntityDeleted(category);
@@ -230,32 +236,33 @@ namespace Moz.Bus.Services.Categories
         /// <summary>
         /// 
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="dto"></param>
         /// <returns></returns>
-        public ServResult SetOrderIndex(ServRequest<SetOrderIndexDto> request)
+        public PublicResult SetOrderIndex(SetOrderIndexDto dto)
         {
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
                 client.Updateable<Category>().SetColumns(it=>new Category
                 {
-                    OrderIndex = request.Data.OrderIndex
-                }).Where(it=>it.Id==request.Data.Id).ExecuteCommand();
+                    OrderIndex = dto.OrderIndex
+                }).Where(it=>it.Id==dto.Id).ExecuteCommand();
             }
             return Ok();
         }
+        
         /*
         /// <summary>
         /// 批量删除
         /// </summary>
         /// <param name="request"></param>
         /// <returns></returns>
-        public ServResult BulkDeleteCategories(ServRequest<BulkDeleteCategoriesDto> request)
+        public PublicResult BulkDeleteCategories(BulkDeleteCategoriesDto dto)
         {
-            using (var client = DbFactory.GetClient())
+            using (var client = DbFactory.CreateClient())
             {
-                client.Deleteable<Category>().In(request.Data.Ids).ExecuteCommand();
+                client.Deleteable<Category>().In(dto.Ids).ExecuteCommand();
             }
-            _eventPublisher.EntitiesDeleted<Category>(request.Data.Ids);
+            _eventPublisher.EntitiesDeleted<Category>(dto.Ids);
             return Ok();
         }
         */
@@ -263,13 +270,13 @@ namespace Moz.Bus.Services.Categories
         /// <summary>
         /// 分页查询
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="dto"></param>
         /// <returns></returns>
-        public ServResult<PagedList<QueryCategoryItem>> PagedQueryCategories(ServRequest<PagedQueryCategoryDto> request)
+        public PublicResult<PagedList<QueryCategoryItem>> PagedQueryCategories(PagedQueryCategoryDto dto)
         {
-            var page = request.Data.Page ?? 1;
-            var pageSize = request.Data.PageSize ?? 1000;
-            using (var client = DbFactory.GetClient())
+            var page = dto.Page ?? 1;
+            var pageSize = dto.PageSize ?? 1000;
+            using (var client = DbFactory.CreateClient())
             {
                 var total = 0;
                 var list = client.Queryable<Category>()
@@ -297,28 +304,59 @@ namespace Moz.Bus.Services.Categories
         }
 
         /// <summary>
+        /// 查询所有子id
+        /// </summary>
+        /// <param name="parentId"></param>
+        /// <param name="includeParentId"></param>
+        /// <returns></returns>
+        public PublicResult<List<long>> QueryChildrenIdsByParentId(long? parentId, bool includeParentId = false)
+        {
+            var ids = new List<long>();
+            GetAllSubCategoryIds(parentId,ids);
+            if (includeParentId && parentId!=null)
+            {
+                ids.Add(parentId.Value);
+            }
+
+            return ids;
+        }
+        
+        private void GetAllSubCategoryIds(long? parentId,List<long> ids) 
+        { 
+            var list = GetCategoriesListCached(); 
+            var subCategories = list.Where(t => t.ParentId == parentId).ToList();
+            foreach (var subCategory in subCategories)
+            {
+                ids.Add(subCategory.Id);
+                GetAllSubCategoryIds(subCategory.Id, ids);
+            }
+        }
+
+        /// <summary>
         /// 根据别名获取路径
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="alias"></param>
         /// <returns></returns>
-        public ServRequest<string> GetCategoryPathByAlias(ServRequest<string> request)
+        public PublicResult<string> GetCategoryPathByAlias(string alias)
         {
-            if (request.Data.IsNullOrEmpty()) return null;
+            if (alias.IsNullOrEmpty()) return null;
             var list = GetCategoriesListCached();
-            return list.FirstOrDefault(it => it.Alias.Equals(request.Data, StringComparison.OrdinalIgnoreCase))
+            return list.FirstOrDefault(it => it.Alias.Equals(alias, StringComparison.OrdinalIgnoreCase))
                 ?.Path;
         }
+        
+        
 
         /// <summary>
         /// 根据别名获取
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="alias"></param>
         /// <returns></returns>
-        public ServResult<string> GetCategoryNameByAlias(ServResult<string> request)
+        public PublicResult<string> GetCategoryNameByAlias(string alias)
         {
-            if (request.Data.IsNullOrEmpty()) return null;
+            if (alias.IsNullOrEmpty()) return null;
             var list = GetCategoriesListCached();
-            return list.FirstOrDefault(it => it.Alias.Equals(request.Data, StringComparison.OrdinalIgnoreCase))
+            return list.FirstOrDefault(it => it.Alias.Equals(alias, StringComparison.OrdinalIgnoreCase))
                 ?.Name;
         }
         
@@ -326,11 +364,11 @@ namespace Moz.Bus.Services.Categories
         /// <summary>
         /// 查询所有子类
         /// </summary>
-        /// <param name="request"></param>
+        /// <param name="parentId"></param>
         /// <returns></returns>
-        public ServResult<List<CategoryTree>> QuerySubCategoriesByParentId(ServRequest<long?> request)
+        public PublicResult<List<CategoryTree>> QuerySubCategoriesByParentId(long? parentId) 
         {
-            return GetAllSubCategories(request.Data);
+            return GetAllSubCategories(parentId);
         }
 
         private List<CategoryTree> GetAllSubCategories(long? parentId)
@@ -338,7 +376,6 @@ namespace Moz.Bus.Services.Categories
             var list = GetCategoriesListCached(); 
             var subCategories = list.Where(t => t.ParentId == parentId).ToList();
             var result = new List<CategoryTree>();
-            // ReSharper disable once ForeachCanBeConvertedToQueryUsingAnotherGetEnumerator
             foreach (var subCategory in subCategories)
             {
                 result.Add(new CategoryTree()
